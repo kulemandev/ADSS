@@ -2,7 +2,7 @@ import random
 import numpy as np
 import pandas as pd
 import time 
-from gurobipy import Model, GRB, quicksum
+from gurobipy import Model, GRB, quicksum, Env
 import math
 from stable_baselines3.common.noise import NormalActionNoise
 import matplotlib.pyplot as plt
@@ -22,6 +22,8 @@ from functools import lru_cache
 from collections import defaultdict
 import importlib.util
 from pathlib import Path
+
+
 
 
 K = 25  #number of PRB
@@ -126,7 +128,7 @@ min_required_datarate_KB = calculate_minmum_required_datarate()
 # generate_gamma(): using real sub-band-CQI measurements
 # ------------------------------------------------------------
 
-DATA_DIR = "subband_cqi_v2"            # folder that holds TOBA gateway subband CQI : UE0.csv … UE<n>.csv
+DATA_DIR = "subband_cqi"            # folder that holds TOBA gateway subband CQI : UE0.csv … UE<n>.csv
 
 
 @lru_cache(maxsize=None)
@@ -239,6 +241,22 @@ def get_num_users_for_slice(slice_id):
     elif slice_id == 3:
         return U_b
 
+_GRB_SILENT_ENV = None
+
+def _get_silent_gurobi_env():
+    global _GRB_SILENT_ENV
+    if _GRB_SILENT_ENV is None:
+        try:
+            # Works on newer gurobipy versions and starts env silently.
+            _GRB_SILENT_ENV = Env(params={"OutputFlag": 0})
+        except TypeError:
+            # Backward-compatible path for older gurobipy versions.
+            env = Env(empty=True)
+            env.setParam("OutputFlag", 0)
+            env.start()
+            _GRB_SILENT_ENV = env
+    return _GRB_SILENT_ENV
+
 def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
     """
     Optimal ILP (Gurobi) allocation 
@@ -254,14 +272,13 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
     # ------------------------------------------------------------
     # 1)  Model & variables 
     # ------------------------------------------------------------
-    model = Model("Optimal_ILP")
-    model.Params.LogToConsole = 0
-    model.setParam("NodefileStart", 0.010)
-    model.setParam("NodefileDir", "/tmp")
-    model.setParam("Threads", 16)
-    model.setParam("MIPFocus", 1)
-    model.setParam("ConcurrentMIP", 4)
-    model.setParam("TimeLimit", 10) 
+    model = Model("Optimal_ILP", env=_get_silent_gurobi_env())
+    model.Params.NodefileStart = 0.010
+    model.Params.NodefileDir = "/tmp"
+    model.Params.Threads = 16
+    model.Params.MIPFocus = 1
+    model.Params.ConcurrentMIP = 4
+    model.Params.TimeLimit = 10
 
     x = model.addVars(U_c, len(Ac), K, T, vtype=GRB.BINARY, name="x")
     y = model.addVars(U_p, len(Ap), K, T, vtype=GRB.BINARY, name="y")
@@ -839,164 +856,6 @@ def run_radiosaber_allocation(gamma):
         slice_throughput_df
     )
 
-def run_nvs_allocation(gamma):
-    """
-    NVS- static reservation and dynamic reuse of unused slots.
-    
-    gamma: dict mapping (i, app, slice, prb) -> achievable throughput
-    APPKEY_LIST: list of all (user, app, slice) combos
-    get_sla: function mapping app -> SLA throughput requirement
-    K: total number of PRBs per slot
-    """
-    prb_assignments = []
-    # 1) fixed reservation per slice as SLA (50%,30%,20%)
-    slot_reservation = {1: 5, 2: 3, 3: 2}
-    current_slot = 0
-
-    # track cumulative allocated throughput per (i, app, slice)
-    alloc_thr = defaultdict(float)
-    
-    # extract per-slice list of (user, app)
-    slice_apps = {
-        s: sorted({(i, a) for (i, a, s_val, k) in gamma if s_val == s})
-        for s in slot_reservation
-    }
-    
-    leftover_slots = []
-
-    # First pass: allocate each slice's reserved slots
-    for s, rsv_slots in slot_reservation.items():
-        apps = slice_apps[s]
-        if not apps:
-            # no apps in this slice — skip and mark slots as leftover
-            leftover_slots.extend(range(current_slot, current_slot + rsv_slots))
-            current_slot += rsv_slots
-            continue
-
-        app_idx = 0
-        for t in range(current_slot, current_slot + rsv_slots):
-            # if all apps have met their SLA, free remaining slots
-            if all(alloc_thr[(i, a, s)] >= get_sla(a) for (i, a) in apps):
-                leftover_slots.extend(range(t, current_slot + rsv_slots))
-                break
-
-            # otherwise assign this slot in round-robin among apps
-            for k in range(K):
-                attempts = 0
-                assigned = False
-                while not assigned and attempts < len(apps):
-                    i_app, a_app = apps[app_idx]
-                    app_idx = (app_idx + 1) % len(apps)
-                    key = (i_app, a_app, s, k)
-                    if key in gamma:
-                        thr = gamma[key]
-                        prb_assignments.append((t, k, i_app, a_app, s, thr))
-                        alloc_thr[(i_app, a_app, s)] += thr
-                        assigned = True
-                    attempts += 1
-        current_slot += rsv_slots
-
-    # Second pass: reuse leftover slots for slices still under SLA
-    needy_slices = [
-        s for s, apps in slice_apps.items()
-        if any(alloc_thr[(i, a, s)] < get_sla(a) for (i, a) in apps)
-    ]
-    needy_rr = {
-        s: {'apps': slice_apps[s], 'idx': 0}
-        for s in needy_slices
-    }
-
-    for t in leftover_slots:
-        for k in range(K):
-            for s in needy_slices:
-                apps = needy_rr[s]['apps']
-                if not apps:
-                    continue
-                idx = needy_rr[s]['idx']
-                i_app, a_app = apps[idx]
-                needy_rr[s]['idx'] = (idx + 1) % len(apps)
-                key = (i_app, a_app, s, k)
-                if key in gamma:
-                    thr = gamma[key]
-                    prb_assignments.append((t, k, i_app, a_app, s, thr))
-                    alloc_thr[(i_app, a_app, s)] += thr
-                    break
-            else:
-                # slot remains unused
-                continue
-            break
-
-    # Build allocation DataFrame
-    allocation_df = pd.DataFrame(
-        prb_assignments,
-        columns=['Slot', 'PRB', 'User', 'App', 'Slice', 'Throughput']
-    )
-    slice_throughput_df = (
-        allocation_df
-          .groupby('Slice')['Throughput']
-          .sum()
-          .reset_index()
-          .rename(columns={'Throughput': 'Total_Throughput'})
-    )
-    allocation_df['App_Key'] = allocation_df.apply(
-        lambda row: (row['User'], row['App'], row['Slice']), axis=1
-    )
-
-    # Total throughput per (user, app, slice)
-    app_throughput_df = (
-        allocation_df.groupby('App_Key')['Throughput']
-        .sum().reset_index()
-    )
-    app_throughput_df[['User', 'App', 'Slice']] = pd.DataFrame(
-        app_throughput_df['App_Key'].tolist(),
-        index=app_throughput_df.index
-    )
-    app_throughput_df.drop(columns=['App_Key'], inplace=True)
-
-    # DataFrame of all combos for zero-fill
-    all_combos_df = pd.DataFrame(APPKEY_LIST, columns=['User', 'App', 'Slice'])
-    merged_df = all_combos_df.merge(
-        app_throughput_df, on=['User', 'App', 'Slice'], how='left'
-    ).fillna({'Throughput': 0.0})
-
-    # Average throughput per App
-    app_episode_thr = (
-        merged_df.groupby('App')['Throughput']
-        .mean().reset_index()
-        .rename(columns={'Throughput': 'Average_Throughput'})
-    )
-
-    # SLA violation metrics
-    violation_counts_per_slice = {s: 0 for s in slot_reservation}
-    violation_gap_per_slice = {s: 0.0 for s in slot_reservation}
-
-    for (i_, a_, s_) in APPKEY_LIST:
-        sla_needed = get_sla(a_)
-        allocated = app_throughput_df.loc[
-            (app_throughput_df['User']==i_) &
-            (app_throughput_df['App']==a_) &
-            (app_throughput_df['Slice']==s_),
-            'Throughput'
-        ]
-        allocated_thr = float(allocated.iloc[0]) if not allocated.empty else 0.0
-        if allocated_thr < sla_needed:
-            violation_counts_per_slice[s_] += 1
-            violation_gap_per_slice[s_] += (1.0 - allocated_thr/sla_needed)
-
-    for s in violation_gap_per_slice:
-        if violation_counts_per_slice[s]:
-            violation_gap_per_slice[s] /= violation_counts_per_slice[s]
-
-    total_violations = sum(violation_counts_per_slice.values())
-    total_throughput = allocation_df['Throughput'].sum()
-
-    return (
-        allocation_df, total_throughput, app_throughput_df,
-        app_episode_thr, violation_counts_per_slice,
-        total_violations, violation_gap_per_slice, slice_throughput_df
-    )
-
-
 def prbs_used_per_slice(alloc_df: pd.DataFrame) -> dict[int,int]:
     """
     Count unique (Slot,PRB) pairs used *per* slice.
@@ -1525,386 +1384,402 @@ def plot_training_metrics(training_results_df):
     plt.show()
 
 def plot_all_results(results_df):
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import numpy as np
-    import pandas as pd
-
     sns.set(style="whitegrid")
-    palette = {
-        'HSRS':       '#b185d4',
-        'RadioSaber': '#407552',
-        'BestCQI':    '#A5D6A7',
-        'NVS':        '#8f9394',
-        'KBL':        '#000000',
-        'XSlice':     '#1f77b4',
-    }
-
-    # --- consistent algorithm order + numbering -------
-    methods = [
-        'HSRS',
-        'RadioSaber',
-        'BestCQI',
-        'NVS',
-        'KBL',
-        'XSlice',
+    method_specs = [
+        ('Optimal',    'Optimal_ILP', '#81D4FA', 'P', '--'),
+        ('ADSS_PPO',   'ADSS_PPO',    'black',   'D', '-'),
+        ('ADSS_DQN',   'ADSS_DQN',    'orangered', 'X', '-'),
+        ('HSRS',       'HSRS',        '#b185d4', 'x', '-.'),
+        ('XSlice',     'XSlice',      '#49a3e4', 'd', '-'),
+        ('RadioSaber', 'RadioSaber',  '#407552', '<', ':'),
+        ('KBL',        'KBL',         'grey',    'o', '-'),
+        ('BestCQI',    'BestCQI',     '#A5D6A7', 's', '--'),
     ]
-    idx_map = {m: i+1 for i, m in enumerate(methods)}
+    methods = [m for m, _, _, _, _ in method_specs]
+    prefix_map = {m: p for m, p, _, _, _ in method_specs}
+    palette = {m: c for m, _, c, _, _ in method_specs}
+    marker_map = {m: mk for m, _, _, mk, _ in method_specs}
+    linestyle_map = {m: ls for m, _, _, _, ls in method_specs}
+    idx_map = {m: i + 1 for i, m in enumerate(methods)}
+
+    def _set_axis_fonts(xlabel=None, ylabel=None):
+        if xlabel is not None:
+            plt.xlabel(xlabel, fontsize=20)
+        if ylabel is not None:
+            plt.ylabel(ylabel, fontsize=20)
+        plt.xticks(fontsize=22)
+        plt.yticks(fontsize=18)
+
+    def _barplot_no_error(**kwargs):
+        # seaborn>=0.12 uses errorbar=None; older versions use ci=None
+        try:
+            return sns.barplot(errorbar=None, **kwargs)
+        except TypeError:
+            return sns.barplot(ci=None, **kwargs)
+
+    active_methods = [m for m in methods if f"{prefix_map[m]}_Total_Throughput" in results_df.columns]
+    if not active_methods:
+        print("No method throughput columns found in results_df.")
+        return
 
     # --- 1) Total throughput ----------------------------
     min_datarate = results_df['Min_required_datarate_KB'].iloc[0]
     plt.figure(figsize=(10, 6))
-    for lbl, col, marker in [
-        ('HSRS',        'HSRS_Total_Throughput',        'x'),
-        ('RadioSaber',  'RadioSaber_Total_Throughput',  '<'),
-        ('BestCQI',     'BestCQI_Total_Throughput',     's'),
-        ('NVS',         'NVS_Total_Throughput',         '^'),
-        ('KBL',         'KBL_Total_Throughput',         'o'),
-        ('XSlice',      'XSlice_Total_Throughput',      'd'),
-    ]:
-        plt.plot(results_df['Simulation'], results_df[col],
-                 marker=marker, label=lbl, color=palette[lbl])
+    for m in active_methods:
+        col = f"{prefix_map[m]}_Total_Throughput"
+        plt.plot(
+            results_df['Simulation'],
+            results_df[col],
+            marker=marker_map[m],
+            label=m,
+            color=palette[m],
+            linestyle=linestyle_map[m],
+        )
     plt.axhline(y=min_datarate, color='r', linestyle='--')
-    plt.text(results_df['Simulation'].min(), min_datarate,
-             f'Min total: {min_datarate} KB',
-             color='r', fontsize=16, ha='left')
-    plt.xlabel('Allocation Episodes', fontsize=22)
-    plt.ylabel('Throughput (Kbit/frame)', fontsize=22)
+    plt.text(
+        results_df['Simulation'].min(),
+        min_datarate,
+        f'Min total: {min_datarate} KB',
+        color='r',
+        fontsize=16,
+        ha='left'
+    )
+    _set_axis_fonts('Allocation Episodes', 'Throughput (Kbit/frame)')
     plt.title('Throughput per Episodes', fontsize=26)
-    plt.xticks(fontsize=20)
-    plt.yticks(fontsize=18)
     handles, labels = plt.gca().get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    plt.legend(handles, numbered, fontsize=20)
+    plt.legend(handles, numbered, fontsize=12)
     plt.tight_layout()
     plt.show()
 
-    # --- 2) PRB-usage ----------------------------------------
+    # --- 2) PRB usage ----------------------------------------
     plt.figure(figsize=(10, 6))
-    for lbl, col, marker in [
-        ('HSRS',        'HSRS_PRB_Usage (%)',        'x'),
-        ('RadioSaber',  'RadioSaber_PRB_Usage (%)',  '<'),
-        ('BestCQI',     'BestCQI_PRB_Usage (%)',     's'),
-        ('NVS',         'NVS_PRB_Usage (%)',         '^'),
-        ('KBL',         'KBL_PRB_Usage (%)',         'o'),
-        ('XSlice',      'XSlice_PRB_Usage (%)',      'd'),
-    ]:
-        plt.plot(results_df['Simulation'], results_df[col],
-                 marker=marker, label=lbl, color=palette[lbl])
-    plt.xlabel('Allocation Episodes', fontsize=18)
-    plt.ylabel('PRB Usage (%)', fontsize=18)
-    plt.title('PRB Usage Rate', fontsize=22)
+    prb_methods = [m for m in active_methods if f"{prefix_map[m]}_PRB_Usage (%)" in results_df.columns]
+    for m in prb_methods:
+        col = f"{prefix_map[m]}_PRB_Usage (%)"
+        plt.plot(
+            results_df['Simulation'],
+            results_df[col],
+            marker=marker_map[m],
+            label=m,
+            color=palette[m],
+            linestyle=linestyle_map[m],
+        )
+    _set_axis_fonts('Allocation Episodes', 'PRB Usage (%)')
+    plt.title('PRB Usage Rate', fontsize=26)
     handles, labels = plt.gca().get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    plt.legend(handles, numbered, fontsize=14)
+    plt.legend(handles, numbered, fontsize=12)
     plt.tight_layout()
     plt.show()
 
     # --- 3) Spectral Efficiency per Episode --------------------
     plt.figure(figsize=(10, 6))
     total_prbs = 250
-    for lbl, thr_col, usage_col, marker in [
-        ('HSRS',        'HSRS_Total_Throughput',        'HSRS_PRB_Usage (%)',        'x'),
-        ('RadioSaber',  'RadioSaber_Total_Throughput',  'RadioSaber_PRB_Usage (%)',  '<'),
-        ('BestCQI',     'BestCQI_Total_Throughput',     'BestCQI_PRB_Usage (%)',     's'),
-        ('NVS',         'NVS_Total_Throughput',         'NVS_PRB_Usage (%)',         '^'),
-        ('KBL',         'KBL_Total_Throughput',         'KBL_PRB_Usage (%)',         'o'),
-        ('XSlice',      'XSlice_Total_Throughput',      'XSlice_PRB_Usage (%)',      'd'),
-    ]:
-        used_prbs = (results_df[usage_col]/100) * total_prbs
-        se = results_df[thr_col] / used_prbs
-        plt.plot(results_df['Simulation'], se,
-                 marker=marker, label=lbl, color=palette[lbl])
-    plt.xlabel('Allocation Episodes', fontsize=18)
-    plt.ylabel('Spectral Efficiency\n(kbit per PRB)', fontsize=18)
-    plt.title('Spectral Efficiency per Episode', fontsize=22)
-    plt.xticks(fontsize=14)
-    plt.yticks(fontsize=14)
+    for m in prb_methods:
+        thr_col = f"{prefix_map[m]}_Total_Throughput"
+        usage_col = f"{prefix_map[m]}_PRB_Usage (%)"
+        used_prbs = (results_df[usage_col] / 100) * total_prbs
+        se = results_df[thr_col] / used_prbs.replace(0, np.nan)
+        plt.plot(
+            results_df['Simulation'],
+            se,
+            marker=marker_map[m],
+            label=m,
+            color=palette[m],
+            linestyle=linestyle_map[m],
+        )
+    _set_axis_fonts('Allocation Episodes', 'Spectral Efficiency (kbit per PRB)')
+    plt.title('Spectral Efficiency per Episode', fontsize=26)
     handles, labels = plt.gca().get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    plt.legend(handles, numbered, fontsize=14)
+    plt.legend(handles, numbered, fontsize=12)
     plt.tight_layout()
     plt.show()
 
     # --- helper maps -----------------------------------------
     slice_mapping = {1: 'Critical Slice', 2: 'Performance Slice', 3: 'Business Slice'}
     slice_nums = [1, 2, 3]
-    # --- 4) Violation Counts per Slice ----------------------
+
+    # --- 4) Violation occurrence per Slice ----------------------
     viol_data = []
     for _, row in results_df.iterrows():
-        for method, pref in [
-            ('HSRS',       'HSRS'),
-            ('RadioSaber', 'RadioSaber'),
-            ('BestCQI',    'BestCQI'),
-            ('NVS',        'NVS'),
-            ('KBL',        'KBL'),
-            ('XSlice',     'XSlice'),
-        ]:
+        for m in active_methods:
+            pref = prefix_map[m]
             for s in slice_nums:
                 viol_data.append({
-                    'Method':          method,
-                    'Slice':           slice_mapping[s],
+                    'Method': m,
+                    'Slice': slice_mapping[s],
                     'Violation_Count': row.get(f'{pref}_Violations_S{s}', 0)
                 })
     viol_df = pd.DataFrame(viol_data)
-    # enforce your desired order
-    viol_df['Method'] = pd.Categorical(
-        viol_df['Method'], categories=methods, ordered=True
-    )
+    viol_df['Method'] = pd.Categorical(viol_df['Method'], categories=active_methods, ordered=True)
 
     plt.figure(figsize=(10, 6))
-    ax = sns.barplot(
+    ax = _barplot_no_error(
         data=viol_df, x='Slice', y='Violation_Count',
-        hue='Method', hue_order=methods,
-        palette=palette
+        hue='Method', hue_order=active_methods,
+        palette={m: palette[m] for m in active_methods}
     )
     for x in [0.5, 1.5]:
         ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
-
-    # rebuild legend with numbers
+    for container in ax.containers:
+        ax.bar_label(
+            container,
+            fmt='%.0f',
+            label_type='edge',
+            padding=3,
+            fontsize=12,
+            color='black'
+        )
     handles, labels = ax.get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    ax.legend(handles, numbered, fontsize=14)
-
-    plt.title('Average Violation Occurrence per Slice', fontsize=22)
-    plt.xlabel('Slice', fontsize=18)
-    plt.ylabel('Violations per Episode', fontsize=18)
+    ax.legend(handles, numbered, fontsize=12)
+    _set_axis_fonts('', 'Violations per Episode')
+    plt.title('Average Violation Occurrence per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
-    # --- 5) Violation Rates per Slice -----------------------
+    # --- 5) Violation rates per Slice -----------------------
     rate_data = []
     for _, row in results_df.iterrows():
-        for method, pref in [
-            ('HSRS',       'HSRS'),
-            ('RadioSaber', 'RadioSaber'),
-            ('BestCQI',    'BestCQI'),
-            ('NVS',        'NVS'),
-            ('KBL',        'KBL'),
-            ('XSlice',     'XSlice'),
-        ]:
+        for m in active_methods:
+            pref = prefix_map[m]
             for s in slice_nums:
                 rate_data.append({
-                    'Method':             method,
-                    'Slice':              slice_mapping[s],
+                    'Method': m,
+                    'Slice': slice_mapping[s],
                     'Violation_Rate (%)': row.get(f'{pref}_Violation_Rate_S{s}', 0)
                 })
     rate_df = pd.DataFrame(rate_data)
-    # enforce order
-    rate_df['Method'] = pd.Categorical(
-        rate_df['Method'], categories=methods, ordered=True
-    )
+    rate_df['Method'] = pd.Categorical(rate_df['Method'], categories=active_methods, ordered=True)
 
     plt.figure(figsize=(10, 6))
-    ax = sns.barplot(
+    ax = _barplot_no_error(
         data=rate_df,
         x='Slice', y='Violation_Rate (%)',
-        hue='Method', hue_order=methods,
-        palette=palette
+        hue='Method', hue_order=active_methods,
+        palette={m: palette[m] for m in active_methods}
     )
     for x in [0.5, 1.5]:
         ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
-
-    # rebuild legend with numbers
+    for container in ax.containers:
+        ax.bar_label(
+            container,
+            fmt='%.0f',
+            label_type='edge',
+            padding=3,
+            fontsize=12,
+            color='black'
+        )
     handles, labels = ax.get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    ax.legend(handles, numbered, fontsize=14)
-
-    plt.xlabel('')
-    plt.ylabel('Violation Rate (%)', fontsize=22)
-    plt.xticks(fontsize=20)
-    plt.yticks(fontsize=20)
+    ax.legend(handles, numbered, fontsize=12)
+    _set_axis_fonts('', 'Violation Rate (%)')
+    plt.title('Average Violation Rate per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
-
-    # --- 6) Violation Gap boxplot ---------------------------
+    # --- 6) Violation gap boxplot ---------------------------
     gap_data = []
     for _, row in results_df.iterrows():
-        for method, pref in [
-            ('HSRS',       'HSRS'),
-            ('RadioSaber', 'RadioSaber'),
-            ('BestCQI',    'BestCQI'),
-            ('NVS',        'NVS'),
-            ('KBL',        'KBL'),
-            ('XSlice',     'XSlice'),
-        ]:
+        for m in active_methods:
+            pref = prefix_map[m]
             for s in slice_nums:
                 gap_data.append({
-                    'Method':       method,
-                    'Slice':        slice_mapping[s],
+                    'Method': m,
+                    'Slice': slice_mapping[s],
                     'Violation_gap': row.get(f'{pref}_Violation_gap_S{s}', 0) * 100
                 })
     gap_df = pd.DataFrame(gap_data)
-    # enforce order
-    gap_df['Method'] = pd.Categorical(
-        gap_df['Method'], categories=methods, ordered=True
-    )
+    gap_df['Method'] = pd.Categorical(gap_df['Method'], categories=active_methods, ordered=True)
 
     plt.figure(figsize=(10, 6))
     ax = sns.boxplot(
         data=gap_df,
         x='Slice', y='Violation_gap',
-        hue='Method', hue_order=methods,
-        palette=palette,
+        hue='Method', hue_order=active_methods,
+        palette={m: palette[m] for m in active_methods},
         showmeans=True,
         meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black"}
     )
     for x in [0.5, 1.5]:
         ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
-
-    # rebuild legend with numbers
     handles, labels = ax.get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    ax.legend(handles, numbered, fontsize=14)
-
-    plt.ylabel('Violation Gap (%)', fontsize=22)
-    plt.xticks(fontsize=20)
-    plt.yticks(fontsize=20)
+    ax.legend(handles, numbered, fontsize=12)
+    _set_axis_fonts('', 'Violation Gap (%)')
+    plt.title('Violation Gap per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
-    
-    # --- 7) Per-Application Average Throughput -------------
+
+    # --- 7) Per-application average throughput -------------
     cols_map = {
-        m: [c for c in results_df.columns if c.startswith(f"{m.replace(' ', '_')}_App_")] for m in methods
+        m: [c for c in results_df.columns if c.startswith(f"{prefix_map[m]}_App_")]
+        for m in active_methods
     }
-    avg = {m: results_df[cols_map[m]].mean().to_dict() for m in methods}
-    achieved = {
-        'Application': app_labels,
-        'SLA':         sla_values,
+    avg = {
+        m: (results_df[cols_map[m]].mean().to_dict() if cols_map[m] else {})
+        for m in active_methods
     }
-    for m in methods:
-        achieved[m] = [avg[m].get(f"{m.replace(' ', '_')}_App_{i+1}_Throughput", 0)
-                        for i in range(len(app_labels))]
+    achieved = {'Application': app_labels, 'SLA': sla_values}
+    for m in active_methods:
+        pref = prefix_map[m]
+        achieved[m] = [avg[m].get(f"{pref}_App_{i+1}_Throughput", 0) for i in range(len(app_labels))]
+
     bar_df = pd.DataFrame(achieved).melt(
         id_vars=['Application', 'SLA'], var_name='Method', value_name='Throughput'
     )
-    bar_df['Method'] = pd.Categorical(bar_df['Method'], categories=methods, ordered=True)
+    bar_df['Method'] = pd.Categorical(bar_df['Method'], categories=active_methods, ordered=True)
 
     plt.figure(figsize=(12, 6))
-    ax = sns.barplot(data=bar_df, x='Application', y='Throughput', hue='Method',
-                     hue_order=methods, palette=palette)
+    ax = _barplot_no_error(
+        data=bar_df, x='Application', y='Throughput', hue='Method',
+        hue_order=active_methods, palette={m: palette[m] for m in active_methods}
+    )
     for x in [1.5, 3.5]:
         ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
-    y_max = bar_df['Throughput'].max()
-    ax.text(0.5, y_max*1.05, 'Critical slice', ha='center', va='bottom', fontsize=20)
-    ax.text(2.5, y_max*1.05, 'Performance slice', ha='center', va='bottom', fontsize=20)
-    ax.text(4.0, y_max*1.05, 'Business slice', ha='center', va='bottom', fontsize=20)
-    # SLA lines
+    y_max = bar_df['Throughput'].max() if len(bar_df) else 1
+    ax.text(0.5, y_max * 1.05, 'Critical slice', ha='center', va='bottom', fontsize=20)
+    ax.text(2.5, y_max * 1.05, 'Performance slice', ha='center', va='bottom', fontsize=20)
+    ax.text(4.0, y_max * 1.05, 'Business slice', ha='center', va='bottom', fontsize=20)
+
     bar_width = 0.25
     app_positions = np.arange(len(app_labels))
     for i, sla in enumerate(sla_values):
         x_start = app_positions[i] - (1.5 * bar_width)
-        x_end   = app_positions[i] + (1.5 * bar_width)
+        x_end = app_positions[i] + (1.5 * bar_width)
         plt.plot([x_start, x_end], [sla, sla], color='red', linestyle='--', linewidth=2)
         plt.text(i, sla + y_max * 0.01, f"SLA: {sla}", color='red', ha='right', fontsize=11)
-    plt.ylabel('Average throughput (Bits/frame)', fontsize=20)
-    plt.xlabel('Applications', fontsize=16)
-    plt.xticks(fontsize=18)
-    plt.yticks(fontsize=14)
+
+    _set_axis_fonts('Applications', 'Average throughput (Bits/frame)')
+    plt.title('Per-Application Average Throughput', fontsize=26)
     handles, labels = ax.get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    ax.legend(handles, numbered, fontsize=18)
+    ax.legend(handles, numbered, fontsize=12)
     plt.tight_layout()
     plt.show()
 
-    # --- 8) Radar: Avg Total Throughput per Slice per Method ----
-    plt.figure(figsize=(10, 6))
-    slice_labels = ['Critical Slice', 'Performance Slice', 'Business Slice']
-    slice_nums = [1, 2, 3]
-    angles = np.linspace(0, 2 * np.pi, len(slice_labels), endpoint=False).tolist()
-    angles += angles[:1]
-    ax = plt.subplot(polar=True)
-    ax.set_theta_offset(np.pi/2)
-    ax.set_theta_direction(-1)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(slice_labels, fontsize=14)
-    ax.set_rlabel_position(0)
-    ax.tick_params(axis='y', labelsize=12)
-    methods_radar = [
-        ('HSRS',       'HSRS',       dict(color=palette['HSRS'],       linestyle='-.', marker='x')),
-        ('RadioSaber', 'RadioSaber', dict(color=palette['RadioSaber'], linestyle=':',  marker='<')),
-        ('BestCQI',    'BestCQI',    dict(color=palette['BestCQI'],    linestyle='--', marker='s')),
-        ('NVS',        'NVS',        dict(color=palette['NVS'],        linestyle=':',  marker='^')),
-        ('KBL',        'KBL',        dict(color=palette['KBL'],        linestyle='-',  marker='o')),
-        ('XSlice',     'XSlice',     dict(color=palette['XSlice'],     linestyle='-',  marker='d')),
+    # --- 8) Spectral efficiency per slice (horizontal grouped) ----
+    se_methods = [
+        m for m in active_methods
+        if all(f"{prefix_map[m]}_SE_S{s}" in results_df.columns for s in [1, 2, 3])
     ]
-    for name, prefix, style in methods_radar:
-        vals = [results_df[f'{prefix}_S{s}_Throughput'].mean() for s in slice_nums]
-        vals += vals[:1]
-        ax.plot(angles, vals, label=f"{idx_map[name]}. {name}", **style)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=12)
-    plt.title('Average Total Throughput per Slice by Method', fontsize=18)
-    plt.tight_layout()
-    plt.show()
+    if se_methods:
+        slice_labels = ['Critical', 'Performance', 'Business']
+        slice_ids = [1, 2, 3]
+        data = np.array([
+            [results_df[f'{prefix_map[m]}_SE_S{s}'].mean() for s in slice_ids]
+            for m in se_methods
+        ])
 
-    # --- 9) Average Spectral Efficiency per Slice (Stacked Bar) ----
-    methods_se = [
-        ('HSRS',       'HSRS',       palette['HSRS']),
-        ('RadioSaber', 'RadioSaber', palette['RadioSaber']),
-        ('BestCQI',    'BestCQI',    palette['BestCQI']),
-        ('NVS',        'NVS',        palette['NVS']),
-        ('KBL',        'KBL',        palette['KBL']),
-        ('XSlice',     'XSlice',     palette['XSlice']),
-    ]
-    slice_labels = ['Critical', 'Performance', 'Business']
-    slice_ids    = [1, 2, 3]
-    data = np.array([[results_df[f'{pref}_SE_S{s}'].mean() for s in slice_ids]
-                     for _, pref, _ in methods_se])
-    plt.figure(figsize=(10,6))
-    x = np.arange(len(methods_se))
-    bottom = np.zeros(len(methods_se))
-    bar_width = 0.6
-    colors = ['orange', 'cyan', '#A5D6A7']
-    for i, sl in enumerate(slice_labels):
-        vals = data[:, i]
-        plt.bar(x, vals, bar_width, bottom=bottom, label=sl, color=colors[i])
-        for j, v in enumerate(vals):
-            if v > 0:
-                plt.text(x[j], bottom[j] + v/2, f'{v:.2f}', ha='center', va='center', fontsize=12)
-        bottom += vals
-    plt.xticks(x, [m[0] for m in methods_se], rotation=0, fontsize=12)
-    plt.ylabel('Avg Spectral Efficiency\n(Bit per RB)', fontsize=14)
-    plt.title('Average Per-Slice Spectral Efficiency', fontsize=16)
-    plt.legend(title='Slice', fontsize=12, title_fontsize=12)
-    plt.tight_layout()
-    plt.show()
+        method_names = se_methods
+        method_colors = {m: palette[m] for m in method_names}
+        method_display_names = [("Optimal" if m in ("Optimal ILP", "Optimal") else m) for m in method_names]
+
+        ##### 1) Stacked bar per-method #####
+        plt.figure(figsize=(10, 6))
+        x = np.arange(len(method_names))
+        bottom = np.zeros_like(x, dtype=float)
+        bar_width = 0.6
+        slice_colors = {
+            'Critical': 'orange',
+            'Performance': 'cyan',
+            'Business': '#A5D6A7',
+        }
+
+        for i, sl in enumerate(slice_labels):
+            vals = data[:, i]
+            plt.bar(
+                x, vals, bar_width,
+                bottom=bottom,
+                label=sl,
+                color=slice_colors[sl]
+            )
+            for j, v in enumerate(vals):
+                if v > 0:
+                    plt.text(
+                        x[j], bottom[j] + v / 2,
+                        f'{v:.2f}',
+                        ha='center', va='center', fontsize=10
+                    )
+            bottom += vals
+
+        plt.xticks(x, method_display_names)
+        plt.ylabel('(Bit per RB)', fontsize=14)
+        plt.xlabel('', fontsize=15)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=18)
+        plt.title('Average Per-Slice Spectral Efficiency', fontsize=26)
+        plt.legend(title='Slice', fontsize=12, title_fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+        ##### 2) Horizontal grouped bar by method #####
+        n_methods, n_slices = data.shape
+        y = np.arange(n_methods)
+        bar_h = 0.8 / n_slices
+
+        ##### 3) Horizontal grouped bar by slice #####
+        data_t = data.T  # slices x methods
+        ys = np.arange(len(slice_labels))
+        bar_h2 = 0.8 / n_methods
+        x_max = np.nanmax(data_t) if np.size(data_t) else 1.0
+        text_offset = 0.01 * (x_max if x_max > 0 else 1.0)
+
+        plt.figure(figsize=(10, 6))
+        for j, m in enumerate(method_names):
+            vals = data_t[:, j]
+            display_label = "Optimal" if m in ("Optimal ILP", "Optimal") else m
+            legend_label = f"{idx_map[m]}. {display_label}"
+            bars = plt.barh(
+                ys + (j - (n_methods - 1) / 2) * bar_h2,
+                vals,
+                height=bar_h2,
+                label=legend_label,
+                color=method_colors[m]
+            )
+            for bar in bars:
+                w = bar.get_width()
+                yc = bar.get_y() + bar.get_height() / 2
+                plt.text(w + text_offset, yc, f'{w:.2f}',
+                         va='center', ha='left', fontsize=13)
+
+        plt.yticks(ys, slice_labels, fontsize=16)
+        plt.xticks(fontsize=14)
+        plt.xlabel('Avg Spectral Efficiency (Bit per RB)', fontsize=16)
+        plt.xlim(0, max(x_max * 1.20, 1.0))
+        plt.legend(loc='lower left', bbox_to_anchor=(0.02, 0.02), fontsize=14, frameon=True)
+        plt.tight_layout()
+        plt.show()
 
 # ------------------------------------------------------------------
 def print_final_results(results_df):
-
-    summary_cols = [
-        'Simulation',
-        'HSRS_Total_Throughput',
-        'RadioSaber_Total_Throughput',
-        'BestCQI_Total_Throughput',
-        'NVS_Total_Throughput',
-        'KBL_Total_Throughput',
-        'XSlice_Total_Throughput',
-
-        'HSRS_PRB_Usage (%)',
-        'RadioSaber_PRB_Usage (%)',
-        'BestCQI_PRB_Usage (%)',
-        'NVS_PRB_Usage (%)',
-        'KBL_PRB_Usage (%)',
-        'XSlice_PRB_Usage (%)',
-
-        'HSRS_Time_Taken',
-        'RadioSaber_Time_Taken',
-        'BestCQI_Time_Taken',
-        'NVS_Time_Taken',
-        'KBL_Time_Taken',
-        'XSlice_Time_Taken',
+    prefixes = [
+        "Optimal_ILP",
+        "ADSS_PPO",
+        "ADSS_DQN",
+        "HSRS",
+        "XSlice",
+        "RadioSaber",
+        "KBL",
+        "BestCQI",
     ]
 
-    app_cols_my  = [c for c in results_df.columns if c.startswith("HSRS_App_")]
-    app_cols_rad = [c for c in results_df.columns if c.startswith("RadioSaber_App_")]
-    app_cols_cqi = [c for c in results_df.columns if c.startswith("BestCQI_App_")]
-    app_cols_nvs = [c for c in results_df.columns if c.startswith("NVS_App_")]
-    app_cols_kbl = [c for c in results_df.columns if c.startswith("KBL_App_")]
-    app_cols_xs = [c for c in results_df.columns if c.startswith("XSlice_App_")]
+    summary_cols = ['Simulation']
+    for pref in prefixes:
+        summary_cols.extend([
+            f'{pref}_Total_Throughput',
+            f'{pref}_PRB_Usage (%)',
+            f'{pref}_Time_Taken',
+        ])
+    summary_cols = [c for c in summary_cols if c in results_df.columns]
 
-    all_cols = summary_cols + app_cols_my + app_cols_rad + app_cols_cqi + app_cols_nvs + app_cols_kbl + app_cols_xs
+    app_cols = []
+    for pref in prefixes:
+        app_cols.extend([c for c in results_df.columns if c.startswith(f"{pref}_App_")])
+
+    all_cols = summary_cols + app_cols
     print("\n=== Final Results Overview ===")
     print(results_df[all_cols].to_string(index=False))
 
