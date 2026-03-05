@@ -35,6 +35,14 @@ SLA_critic = {1: 400, 2:900}
 SLA_perf   = {3: 10000, 4: 20}  
 SLA_busi   = {5: 20000}        
 
+APP_PACKET_PROFILE = {
+    1: {"payload_bits": 400.0,  "pdb_ms": 5.0},   # ETCS
+    2: {"payload_bits": 900.0,  "pdb_ms": 5.0},   # Voice
+    3: {"payload_bits": 1000.0, "pdb_ms": 10.0},  # CCTV
+    4: {"payload_bits": 20.0,   "pdb_ms": 10.0},  # PIS
+    5: {"payload_bits": 1000.0, "pdb_ms": 10.0},  # Pwifi
+}
+
 
 # Application categories identifier
 Ac = [1, 2]  # critical 1: ETCS  2: Voice 
@@ -878,6 +886,143 @@ def slice_spectral_efficiency(alloc_df: pd.DataFrame) -> dict[int,float]:
             for s in set(list(thr)+list(prb_counts))}
 
 
+def _split_episode_volume_into_jobs(episode_bits_expected: float, payload_bits: float) -> list[float]:
+    """
+    Split one app's episode demand into packet jobs by payload size.
+    """
+    if episode_bits_expected <= 0:
+        return []
+    payload = max(float(payload_bits), 1e-9)
+    full_jobs = int(episode_bits_expected // payload)
+    rem_bits = float(episode_bits_expected - (full_jobs * payload))
+    jobs = [payload] * full_jobs
+    if rem_bits > 1e-9:
+        jobs.append(rem_bits)
+    if not jobs:
+        jobs = [float(episode_bits_expected)]
+    return jobs
+
+
+def compute_delay_violation_metrics(
+    allocation_df: Optional[pd.DataFrame],
+    app_packet_profile: Optional[dict] = None,
+    slot_ms: float = 1.0,
+    episode_slots: int = T,
+    appkeys: Optional[list[tuple[int, int, int]]] = None,
+):
+    """
+    Job-based delay metric computation (single episode, no carry-over between episodes).
+
+    Rules:
+      - Demand per (user, app, slice) is the SLA bits for this episode.
+      - Demand is split into jobs using APP_PACKET_PROFILE payload_bits.
+      - Jobs are served FIFO from slot throughput allocations of that app key.
+      - Delay violation if completion time > app pdb_ms, or unfinished by episode end.
+      - Unfinished jobs are dropped at end of episode.
+    """
+    slice_ids = [1, 2, 3]
+    total_jobs_per_slice = {s: 0 for s in slice_ids}
+    viol_jobs_per_slice = {s: 0 for s in slice_ids}
+    dropped_jobs_per_slice = {s: 0 for s in slice_ids}
+    delay_sum_per_app = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    delay_cnt_per_app = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+
+    if app_packet_profile is None:
+        app_packet_profile = APP_PACKET_PROFILE
+    if appkeys is None:
+        appkeys = APPKEY_LIST
+
+    # Normalize profile keys to int app IDs.
+    profile = {}
+    for k, v in app_packet_profile.items():
+        try:
+            profile[int(k)] = v
+        except Exception:
+            continue
+
+    # Empty allocation is valid: every job remains unserved/dropped.
+    if allocation_df is None or allocation_df.empty:
+        allocation_df = pd.DataFrame(columns=['User', 'App', 'Slice', 'Slot', 'Throughput'])
+
+    app_slot_thr = (
+        allocation_df.groupby(['User', 'App', 'Slice', 'Slot'])['Throughput']
+        .sum()
+        .to_dict()
+    )
+
+    episode_ms = float(episode_slots) * float(slot_ms)
+
+    for (u, a, s) in appkeys:
+        sla_bits = float(get_sla(a))
+        if sla_bits <= 0:
+            continue
+
+        cfg = profile.get(int(a), {})
+        payload_bits = float(cfg.get("payload_bits", sla_bits))
+        pdb_ms = float(cfg.get("pdb_ms", episode_ms))
+        if not np.isfinite(pdb_ms) or pdb_ms <= 0:
+            pdb_ms = episode_ms
+
+        jobs = _split_episode_volume_into_jobs(sla_bits, payload_bits)
+        if not jobs:
+            continue
+
+        slot_budget = [
+            float(app_slot_thr.get((u, a, s, t), 0.0))
+            for t in range(int(episode_slots))
+        ]
+
+        for job_bits in jobs:
+            total_jobs_per_slice[s] += 1
+            bits_left = float(job_bits)
+            completion_slot = None
+
+            for t in range(int(episode_slots)):
+                available = slot_budget[t]
+                if available <= 0:
+                    continue
+                served = min(bits_left, available)
+                slot_budget[t] -= served
+                bits_left -= served
+                if bits_left <= 1e-9:
+                    completion_slot = t
+                    break
+
+            if completion_slot is None:
+                # Not completed by episode end -> dropped and violated.
+                viol_jobs_per_slice[s] += 1
+                dropped_jobs_per_slice[s] += 1
+                delay_sum_per_app[a] += episode_ms
+                delay_cnt_per_app[a] += 1
+            else:
+                completion_ms = (completion_slot + 1) * float(slot_ms)
+                delay_sum_per_app[a] += completion_ms
+                delay_cnt_per_app[a] += 1
+                if completion_ms > (pdb_ms + 1e-12):
+                    viol_jobs_per_slice[s] += 1
+
+    delay_rate_per_slice = {}
+    for s in slice_ids:
+        tot = total_jobs_per_slice[s]
+        vio = viol_jobs_per_slice[s]
+        delay_rate_per_slice[s] = (100.0 * vio / tot) if tot > 0 else 0.0
+    avg_delay_per_app = {
+        a: (delay_sum_per_app[a] / delay_cnt_per_app[a]) if delay_cnt_per_app[a] > 0 else 0.0
+        for a in delay_sum_per_app
+    }
+
+    return {
+        'Delay_Total_Jobs_Per_Slice': total_jobs_per_slice,
+        'Delay_Violations_Per_Slice': viol_jobs_per_slice,
+        'Delay_Violation_Rate_Per_Slice': delay_rate_per_slice,
+        'Delay_Dropped_Per_Slice': dropped_jobs_per_slice,
+        'Delay_Avg_Delay_Per_App_ms': avg_delay_per_app,
+        'Delay_Total_Jobs': int(sum(total_jobs_per_slice.values())),
+        'Delay_Total_Violations': int(sum(viol_jobs_per_slice.values())),
+        'Delay_Total_Dropped': int(sum(dropped_jobs_per_slice.values())),
+    }
+
+
 @lru_cache(maxsize=None)
 def _load_kbl_modules():
     base = Path(__file__).resolve().parent / "network-slicing"
@@ -1536,7 +1681,7 @@ def plot_all_results(results_df):
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
     _set_axis_fonts('', 'Violations per Episode')
-    plt.title('Average Violation Occurrence per Slice', fontsize=26)
+    plt.title('Thrpt Violation Occurrence per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
@@ -1576,7 +1721,7 @@ def plot_all_results(results_df):
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
     _set_axis_fonts('', 'Violation Rate (%)')
-    plt.title('Average Violation Rate per Slice', fontsize=26)
+    plt.title('Thrpt Violation Rate per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
@@ -1609,11 +1754,58 @@ def plot_all_results(results_df):
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
     _set_axis_fonts('', 'Violation Gap (%)')
-    plt.title('Violation Gap per Slice', fontsize=26)
+    plt.title('Thrpt Violation Gap per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
-    # --- 7) Per-application average throughput -------------
+    # --- 7) Delay violation rates per Slice ----------
+    delay_methods = [
+        m for m in active_methods
+        if any(f"{prefix_map[m]}_Delay_Violation_Rate_S{s}" in results_df.columns for s in [1, 2, 3])
+    ]
+    if delay_methods:
+        delay_rate_data = []
+        for _, row in results_df.iterrows():
+            for m in delay_methods:
+                pref = prefix_map[m]
+                for s in slice_nums:
+                    delay_rate_data.append({
+                        'Method': m,
+                        'Slice': slice_mapping[s],
+                        'Delay_Violation_Rate (%)': row.get(f'{pref}_Delay_Violation_Rate_S{s}', 0)
+                    })
+        delay_rate_df = pd.DataFrame(delay_rate_data)
+        delay_rate_df['Method'] = pd.Categorical(
+            delay_rate_df['Method'], categories=delay_methods, ordered=True
+        )
+
+        plt.figure(figsize=(10, 6))
+        ax = _barplot_no_error(
+            data=delay_rate_df, x='Slice', y='Delay_Violation_Rate (%)',
+            hue='Method', hue_order=delay_methods,
+            palette={m: palette[m] for m in delay_methods}
+        )
+        for x in [0.5, 1.5]:
+            ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
+        for container in ax.containers:
+            ax.bar_label(
+                container,
+                fmt='%.0f',
+                label_type='edge',
+                padding=3,
+                fontsize=12,
+                color='black'
+            )
+        handles, labels = ax.get_legend_handles_labels()
+        numbered = [f"{idx_map[l]}. {l}" for l in labels]
+        ax.legend(handles, numbered, fontsize=12)
+        _set_axis_fonts('', 'Delay Violation Rate (%)')
+        plt.title('Delay Violation Rate per Slice', fontsize=26)
+        plt.tight_layout()
+        plt.show()
+
+
+    # --- 10) Per-application average throughput -------------
     cols_map = {
         m: [c for c in results_df.columns if c.startswith(f"{prefix_map[m]}_App_")]
         for m in active_methods
@@ -1660,7 +1852,48 @@ def plot_all_results(results_df):
     plt.tight_layout()
     plt.show()
 
-    # --- 8) Spectral efficiency per slice (horizontal grouped) ----
+    # --- 9) Per-application average delay -------------------
+    delay_app_cols_map = {
+        m: [
+            c for c in results_df.columns
+            if c.startswith(f"{prefix_map[m]}_App_") and c.endswith("_Avg_Delay_ms")
+        ]
+        for m in active_methods
+    }
+    delay_app_methods = [m for m in active_methods if delay_app_cols_map[m]]
+    if delay_app_methods:
+        delay_data = {'Application': app_labels}
+        for m in delay_app_methods:
+            pref = prefix_map[m]
+            avg_vals = results_df[delay_app_cols_map[m]].mean().to_dict()
+            delay_data[m] = [
+                avg_vals.get(f"{pref}_App_{i+1}_Avg_Delay_ms", 0.0)
+                for i in range(len(app_labels))
+            ]
+
+        delay_df = pd.DataFrame(delay_data).melt(
+            id_vars=['Application'], var_name='Method', value_name='Average_Delay_ms'
+        )
+        delay_df['Method'] = pd.Categorical(
+            delay_df['Method'], categories=delay_app_methods, ordered=True
+        )
+
+        plt.figure(figsize=(12, 6))
+        ax = _barplot_no_error(
+            data=delay_df, x='Application', y='Average_Delay_ms', hue='Method',
+            hue_order=delay_app_methods, palette={m: palette[m] for m in delay_app_methods}
+        )
+        for x in [1.5, 3.5]:
+            ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
+        _set_axis_fonts('Applications', 'Average Delay (ms)')
+        plt.title('Average Delay per App', fontsize=26)
+        handles, labels = ax.get_legend_handles_labels()
+        numbered = [f"{idx_map[l]}. {l}" for l in labels]
+        ax.legend(handles, numbered, fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+    # --- 10) Spectral efficiency per slice (horizontal grouped) ----
     se_methods = [
         m for m in active_methods
         if all(f"{prefix_map[m]}_SE_S{s}" in results_df.columns for s in [1, 2, 3])
