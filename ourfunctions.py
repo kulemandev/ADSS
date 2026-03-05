@@ -295,6 +295,8 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
     SlackCrit = model.addVars(U_c, len(Ac), vtype=GRB.CONTINUOUS, lb=0)
     SlackPerf = model.addVars(U_p, len(Ap), vtype=GRB.CONTINUOUS, lb=0)
     SlackBus  = model.addVars(U_b, len(Ab), vtype=GRB.CONTINUOUS, lb=0)
+    # Delay slack for critical apps: unmet demand before app deadline.
+    SlackDelayCrit = model.addVars(U_c, len(Ac), vtype=GRB.CONTINUOUS, lb=0)
 
     # 2)  PRB-capacity constraints 
 
@@ -322,6 +324,29 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
                 ) >= SLA_critic[a]
             )
 
+    # 3-bis) Delay deadline constraints for critical slice only.
+    # deadline_slot = ceil(pdb_ms / slot_ms), with slot_ms=1 ms and clamped in [1, T].
+    slot_ms = 1.0
+    delay_deadline_slot = {}
+    for a in Ac:
+        cfg = APP_PACKET_PROFILE.get(a, {})
+        pdb_ms = float(cfg.get("pdb_ms", T * slot_ms))
+        if not np.isfinite(pdb_ms) or pdb_ms <= 0:
+            pdb_ms = T * slot_ms
+        deadline_slot = int(math.ceil(pdb_ms / slot_ms))
+        delay_deadline_slot[a] = max(1, min(T, deadline_slot))
+
+    for i_loc in range(U_c):
+        i_glob = crit_users[i_loc]
+        for a_idx, a in enumerate(Ac):
+            dslot = delay_deadline_slot[a]
+            model.addConstr(
+                quicksum(
+                    x[i_loc, a_idx, k_, t_] * gamma.get((i_glob, a, 1, k_), 0)
+                    for k_ in range(K) for t_ in range(dslot)
+                ) + SlackDelayCrit[i_loc, a_idx] >= SLA_critic[a]
+            )
+
     for i_loc in range(U_p):
         i_glob = perf_users[i_loc]
         for a_idx, a in enumerate(Ap):
@@ -345,12 +370,17 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
     # 4)  Objective 
 
     alpha_c, alpha_p, alpha_b = 2000, 2000, 1000
+    alpha_delay_crit = 4000
     model.setObjective(
         wp * quicksum(y[i, a, k_, t] for i in range(U_p) for a in range(len(Ap)) for k_ in range(K) for t in range(T))
       + wb * quicksum(z[i, a, k_, t] for i in range(U_b) for a in range(len(Ab)) for k_ in range(K) for t in range(T))
       + wc * quicksum(x[i, a, k_, t] for i in range(U_c) for a in range(len(Ac)) for k_ in range(K) for t in range(T))
       + alpha_b * quicksum(SlackBus[i, a] / SLA_busi[Ab[a]] for i in range(U_b) for a in range(len(Ab)))
-      + alpha_p * quicksum(SlackPerf[i, a] / SLA_perf[Ap[a]] for i in range(U_p) for a in range(len(Ap))),
+      + alpha_p * quicksum(SlackPerf[i, a] / SLA_perf[Ap[a]] for i in range(U_p) for a in range(len(Ap)))
+      + alpha_delay_crit * quicksum(
+            SlackDelayCrit[i, a] / max(SLA_critic[Ac[a]], 1e-9)
+            for i in range(U_c) for a in range(len(Ac))
+        ),
       GRB.MINIMIZE
     )
 
