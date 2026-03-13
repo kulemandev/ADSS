@@ -265,10 +265,12 @@ def _get_silent_gurobi_env():
             _GRB_SILENT_ENV = env
     return _GRB_SILENT_ENV
 
-def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
+def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1, return_decision_time=False):
     """
     Optimal ILP (Gurobi) allocation 
     """
+
+    decision_t0 = time.perf_counter()
 
     # Sort TOBA gatexyas (UE)  ids per slices
     crit_users = sorted({i for (i, a, s, _) in gamma if s == 1})  
@@ -370,7 +372,7 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
     # 4)  Objective 
 
     alpha_c, alpha_p, alpha_b = 2000, 2000, 1000
-    alpha_delay_crit = 4000
+    alpha_delay_crit = 3000
     model.setObjective(
         wp * quicksum(y[i, a, k_, t] for i in range(U_p) for a in range(len(Ap)) for k_ in range(K) for t in range(T))
       + wb * quicksum(z[i, a, k_, t] for i in range(U_b) for a in range(len(Ab)) for k_ in range(K) for t in range(T))
@@ -391,11 +393,11 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
         model.optimize()
     except Exception as e:
         print(f"Gurobi optimization failed: {e}")
-        return (None,)*7
+        return (None,)*9 if return_decision_time else (None,)*8
 
     if model.SolCount == 0:          # no feasible solution found at all
         print("No incumbent solution.")
-        return (None,)*7
+        return (None,)*9 if return_decision_time else (None,)*8
 
     # ------------------------------------------------------------
     # 6)  Extract the solution 
@@ -431,6 +433,8 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
                         thr = gamma.get((i_glob, a, 3, k_), 0)
                         prb_assignments.append((t_, k_, i_glob, a, 3, thr))
                         total_throughput += thr
+
+    decision_time_s = time.perf_counter() - decision_t0
 
     # ------------------------------------------------------------
     # 7)  Metrics & DataFrames 
@@ -472,18 +476,24 @@ def run_allocation_solver(gamma, wc=0.01, wp=0.6, wb=1):
     violation_gap_per_slice[2] /= ((SLA_perf[3]+SLA_perf[4])     * U_p)
     violation_gap_per_slice[3] /= (SLA_busi[5]                   * U_b)
 
-    return (allocation_df, total_throughput, app_throughput_df,
-            app_episode_thr, violation_counts_per_slice,
-            total_violations, violation_gap_per_slice, slice_throughput_df)
+    out = (
+        allocation_df, total_throughput, app_throughput_df,
+        app_episode_thr, violation_counts_per_slice,
+        total_violations, violation_gap_per_slice, slice_throughput_df
+    )
+    if return_decision_time:
+        return out + (decision_time_s,)
+    return out
 
 
-def run_bestcqi_allocation(gamma):
+def run_bestcqi_allocation(gamma, return_decision_time=False):
     # Assign each PRB in each time slot to (i, a, s) that has the highest achievable datarate in gamma
 
     # Initialize per-app cumulative allocation counter
     allocated_so_far = { key: 0.0 for key in APPKEY_LIST }
     drift = 0.8
     prb_assignments = []
+    decision_t0 = time.perf_counter()
 
     for t in range(T):
         for k_ in range(K):
@@ -521,6 +531,8 @@ def run_bestcqi_allocation(gamma):
                     # Record and update
                     prb_assignments.append((t, k_, i_sel, a_sel, s_sel, delta))
                     allocated_so_far[app_key] += delta
+
+    decision_time_s = time.perf_counter() - decision_t0
 
 
     allocation_df = pd.DataFrame(prb_assignments, 
@@ -597,7 +609,7 @@ def run_bestcqi_allocation(gamma):
     total_violations = sum(violation_counts_per_slice.values())
     total_throughput = allocation_df['Throughput'].sum()
 
-    return (
+    out = (
         allocation_df,
         total_throughput,
         app_throughput_df,
@@ -606,9 +618,12 @@ def run_bestcqi_allocation(gamma):
         total_violations,
         violation_gap_per_slice,slice_throughput_df
     )
+    if return_decision_time:
+        return out + (decision_time_s,)
+    return out
 
 
-def run_myheuristic_allocation(gamma):
+def run_myheuristic_allocation(gamma, return_decision_time=False):
     """
     Two-phase cascaded scheduler:
       1) Phase Critique : minimal-slack greedy
@@ -620,6 +635,7 @@ def run_myheuristic_allocation(gamma):
     # Initialise slack bits for every app
     slack = {key: get_sla(key[1]) for key in APPKEY_LIST}
     prb_assignments = []
+    decision_t0 = time.perf_counter()
 
     # Phase 1: Critical slice greedy slack reduction
     for t in range(T):
@@ -666,6 +682,8 @@ def run_myheuristic_allocation(gamma):
                 g = g * drift
                 slack[(i, a, s)] -= g
                 prb_assignments.append((t, k, i, a, s, g))
+
+    decision_time_s = time.perf_counter() - decision_t0
 
     # Build allocation DataFrame
     allocation_df = pd.DataFrame(
@@ -725,7 +743,7 @@ def run_myheuristic_allocation(gamma):
     total_throughput = allocation_df['Throughput'].sum()
     total_violations = sum(violation_counts_per_slice.values())
 
-    return (
+    out = (
         allocation_df,
         total_throughput,
         app_throughput_df,
@@ -734,10 +752,13 @@ def run_myheuristic_allocation(gamma):
         total_violations,
         violation_gap_per_slice, slice_throughput_df
     )
+    if return_decision_time:
+        return out + (decision_time_s,)
+    return out
 
 
 
-def run_radiosaber_allocation(gamma):
+def run_radiosaber_allocation(gamma, return_decision_time=False):
     """
     RadioSaber-inspired RBG scheduler with dynamic per-slot quotas and per-PRB payload capping.
 
@@ -765,6 +786,7 @@ def run_radiosaber_allocation(gamma):
         slice_payload[s] += rem
 
     prb_assignments = []
+    decision_t0 = time.perf_counter()
 
     # ----- Per-slot scheduling -----
     for t in range(T):
@@ -828,6 +850,8 @@ def run_radiosaber_allocation(gamma):
                 # record assignment
                 prb_assignments.append((t, prb, u_sel, a_sel, sel_slice, actual))
 
+    decision_time_s = time.perf_counter() - decision_t0
+
     # ----- Build DataFrames & metrics -----
     allocation_df = pd.DataFrame(
         prb_assignments,
@@ -883,7 +907,7 @@ def run_radiosaber_allocation(gamma):
     total_violations = sum(violation_counts_per_slice.values())
     total_throughput = allocation_df['Throughput'].sum()
 
-    return (
+    out = (
         allocation_df,
         total_throughput,
         app_throughput_df,
@@ -893,6 +917,9 @@ def run_radiosaber_allocation(gamma):
         violation_gap_per_slice,
         slice_throughput_df
     )
+    if return_decision_time:
+        return out + (decision_time_s,)
+    return out
 
 def prbs_used_per_slice(alloc_df: pd.DataFrame) -> dict[int,int]:
     """
@@ -1068,7 +1095,25 @@ def _load_kbl_modules():
     return kbrl, kernel, projectron
 
 
-def run_kbl_allocation(gamma, accuracy_range=(0.99, 0.999), alfa=0.05, drift_fallback=0.5):
+def _safe_torch_load(path, map_location="cpu"):
+    """
+    Compatibility wrapper:
+      - prefers weights_only=True (avoids FutureWarning and is safer)
+      - falls back for older torch versions that do not support it
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def run_kbl_allocation(
+    gamma,
+    accuracy_range=(0.99, 0.999),
+    alfa=0.05,
+    drift_fallback=0.5,
+    return_decision_time=False
+):
     """
     KBL (KBRL) allocation using the kernel-based RL controller from the repo.
     We adapt it to the current (gamma, SLA) setting by:
@@ -1110,6 +1155,7 @@ def run_kbl_allocation(gamma, accuracy_range=(0.99, 0.999), alfa=0.05, drift_fal
     allocation_so_far = {ak: 0.0 for ak in APPKEY_LIST}
     slack = {ak: get_sla(ak[1]) for ak in APPKEY_LIST}
     prev_prb_used = {1: 0, 2: 0, 3: 0}
+    decision_t0 = time.perf_counter()
 
     # Precompute best thr per slice/prb for state feature
     best_thr_by_slice_prb = {s: [0.0] * K for s in [1, 2, 3]}
@@ -1194,6 +1240,8 @@ def run_kbl_allocation(gamma, accuracy_range=(0.99, 0.999), alfa=0.05, drift_fal
         kbl.update_control(state, action, SLA_labels)
         prev_prb_used = used_prbs
 
+    decision_time_s = time.perf_counter() - decision_t0
+
     allocation_df = pd.DataFrame(
         allocation_records,
         columns=['Slot', 'PRB', 'User', 'App', 'Slice', 'Throughput']
@@ -1254,7 +1302,7 @@ def run_kbl_allocation(gamma, accuracy_range=(0.99, 0.999), alfa=0.05, drift_fal
     total_violations = sum(violation_counts_per_slice.values())
     total_throughput = allocation_df['Throughput'].sum()
 
-    return (
+    out = (
         allocation_df,
         total_throughput,
         app_throughput_df,
@@ -1264,6 +1312,9 @@ def run_kbl_allocation(gamma, accuracy_range=(0.99, 0.999), alfa=0.05, drift_fal
         violation_gap_per_slice,
         slice_throughput_df
     )
+    if return_decision_time:
+        return out + (decision_time_s,)
+    return out
 
 
 class XSliceActorCritic(nn.Module):
@@ -1372,6 +1423,7 @@ def run_xslice_allocation(
     gamma_rl=0.95,
     clip_eps=0.2,
     drift_fallback=0.5,
+    return_decision_time=False,
 ):
     obs_dim = 12
     model = XSliceActorCritic(obs_dim)
@@ -1437,7 +1489,7 @@ def run_xslice_allocation(
         torch.save({'model': model.state_dict()}, model_path)
 
     if os.path.isfile(model_path):
-        ckpt = torch.load(model_path, map_location="cpu")
+        ckpt = _safe_torch_load(model_path, map_location="cpu")
         model.load_state_dict(ckpt['model'])
     model.eval()
 
@@ -1445,6 +1497,7 @@ def run_xslice_allocation(
     allocation_so_far = {ak: 0.0 for ak in APPKEY_LIST}
     slack = {ak: get_sla(ak[1]) for ak in APPKEY_LIST}
     prev_prb_used = {1: 0, 2: 0, 3: 0}
+    decision_t0 = time.perf_counter()
 
     for t in range(T):
         state = _build_xslice_state(gamma, allocation_so_far, prev_prb_used)
@@ -1465,6 +1518,8 @@ def run_xslice_allocation(
         )
         allocation_records.extend(alloc_records)
         prev_prb_used = used_prbs
+
+    decision_time_s = time.perf_counter() - decision_t0
 
     allocation_df = pd.DataFrame(
         allocation_records,
@@ -1522,7 +1577,7 @@ def run_xslice_allocation(
     total_violations = sum(violation_counts_per_slice.values())
     total_throughput = allocation_df['Throughput'].sum()
 
-    return (
+    out = (
         allocation_df,
         total_throughput,
         app_throughput_df,
@@ -1532,6 +1587,9 @@ def run_xslice_allocation(
         violation_gap_per_slice,
         slice_throughput_df
     )
+    if return_decision_time:
+        return out + (decision_time_s,)
+    return out
 
 #--------------------PLOTS-------------------------------------------
 
@@ -1672,6 +1730,70 @@ def plot_all_results(results_df):
     plt.tight_layout()
     plt.show()
 
+    # --- 3-bis) Jain Fairness per Episode ----------------------
+    jain_methods = [m for m in active_methods if f"{prefix_map[m]}_Jain_Fairness" in results_df.columns]
+    if jain_methods:
+        plt.figure(figsize=(10, 6))
+        for m in jain_methods:
+            col = f"{prefix_map[m]}_Jain_Fairness"
+            plt.plot(
+                results_df['Simulation'],
+                results_df[col],
+                marker=marker_map[m],
+                label=m,
+                color=palette[m],
+                linestyle=linestyle_map[m],
+            )
+        _set_axis_fonts('Allocation Episodes', "Jain's Fairness Index")
+        plt.ylim(0, 1.05)
+        plt.title("Jain's Fairness per Episode", fontsize=26)
+        plt.yticks(fontsize=18)
+        handles, labels = plt.gca().get_legend_handles_labels()
+        numbered = [f"{idx_map[l]}. {l}" for l in labels]
+        plt.legend(handles, numbered, fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+        # --- 3-ter) Average Jain Fairness (bar) ----------------
+        avg_jain_df = pd.DataFrame({
+            'Method': jain_methods,
+            'Average_Jain_Fairness': [
+                results_df[f"{prefix_map[m]}_Jain_Fairness"].mean() for m in jain_methods
+            ]
+        })
+        avg_jain_df['Method'] = pd.Categorical(
+            avg_jain_df['Method'], categories=jain_methods, ordered=True
+        )
+
+        plt.figure(figsize=(10, 6))
+        ax = _barplot_no_error(
+            data=avg_jain_df,
+            x='Method',
+            y='Average_Jain_Fairness',
+            hue='Method',
+            hue_order=jain_methods,
+            palette={m: palette[m] for m in jain_methods},
+            order=jain_methods,
+            dodge=False
+        )
+        for container in ax.containers:
+            ax.bar_label(
+                container,
+                fmt='%.3f',
+                label_type='edge',
+                padding=3,
+                fontsize=12,
+                color='black'
+            )
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        _set_axis_fonts('', "Average Jain's Fairness Index")
+        plt.ylim(0, 1.05)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.title("Average Jain's Fairness per Method", fontsize=26)
+        plt.tight_layout()
+        plt.show()
     # --- helper maps -----------------------------------------
     slice_mapping = {1: 'Critical Slice', 2: 'Performance Slice', 3: 'Business Slice'}
     slice_nums = [1, 2, 3]
@@ -1701,7 +1823,7 @@ def plot_all_results(results_df):
     for container in ax.containers:
         ax.bar_label(
             container,
-            fmt='%.0f',
+            fmt='%.1f',
             label_type='edge',
             padding=3,
             fontsize=12,
@@ -1741,7 +1863,7 @@ def plot_all_results(results_df):
     for container in ax.containers:
         ax.bar_label(
             container,
-            fmt='%.0f',
+            fmt='%.1f',
             label_type='edge',
             padding=3,
             fontsize=12,
@@ -1775,7 +1897,7 @@ def plot_all_results(results_df):
         x='Slice', y='Violation_gap',
         hue='Method', hue_order=active_methods,
         palette={m: palette[m] for m in active_methods},
-        showmeans=True,
+        showmeans=True,showfliers=False,
         meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black"}
     )
     for x in [0.5, 1.5]:
@@ -1820,7 +1942,7 @@ def plot_all_results(results_df):
         for container in ax.containers:
             ax.bar_label(
                 container,
-                fmt='%.0f',
+                fmt='%.1f',
                 label_type='edge',
                 padding=3,
                 fontsize=12,
