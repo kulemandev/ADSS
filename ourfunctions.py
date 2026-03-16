@@ -1746,7 +1746,7 @@ def plot_all_results(results_df):
             )
         _set_axis_fonts('Allocation Episodes', "Jain's Fairness Index")
         plt.ylim(0, 1.05)
-        plt.title("Jain's Fairness per Episode", fontsize=26)
+        plt.title("Jain's Fairness", fontsize=26)
         plt.yticks(fontsize=18)
         handles, labels = plt.gca().get_legend_handles_labels()
         numbered = [f"{idx_map[l]}. {l}" for l in labels]
@@ -1791,7 +1791,7 @@ def plot_all_results(results_df):
         plt.ylim(0, 1.05)
         plt.xticks(fontsize=14)
         plt.yticks(fontsize=14)
-        plt.title("Average Jain's Fairness per Method", fontsize=26)
+        plt.title("Jain's Fairness", fontsize=26)
         plt.tight_layout()
         plt.show()
     # --- helper maps -----------------------------------------
@@ -1833,7 +1833,7 @@ def plot_all_results(results_df):
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
     _set_axis_fonts('', 'Violations per Episode')
-    plt.title('Thrpt Violation Occurrence per Slice', fontsize=26)
+    plt.title('Throughput Violation Occurrence per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
@@ -1873,7 +1873,7 @@ def plot_all_results(results_df):
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
     _set_axis_fonts('', 'Violation Rate (%)')
-    plt.title('Thrpt Violation Rate per Slice', fontsize=26)
+    plt.title('Throughput Violation Rate per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
@@ -1906,7 +1906,7 @@ def plot_all_results(results_df):
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
     _set_axis_fonts('', 'Violation Gap (%)')
-    plt.title('Thrpt Violation Gap per Slice', fontsize=26)
+    plt.title('Throughput Violation Gap per Slice', fontsize=26)
     plt.tight_layout()
     plt.show()
 
@@ -2140,33 +2140,44 @@ def plot_all_results(results_df):
 
 # ------------------------------------------------------------------
 def print_final_results(results_df):
-    prefixes = [
-        "Optimal_ILP",
-        "ADSS_PPO",
-        "ADSS_DQN",
-        "HSRS",
-        "XSlice",
-        "RadioSaber",
-        "KBL",
-        "BestCQI",
+    methods = ["ADSS_DQN", "ADSS_PPO"]
+    slice_labels = {
+        1: "Critic",
+        2: "Perf",
+        3: "Business",
+    }
+    metric_specs = [
+        ("Delay", "{method}_Delay_Violation_Rate_S{slice_id}"),
+        ("Throughput", "{method}_Violation_Rate_S{slice_id}"),
     ]
 
-    summary_cols = ['Simulation']
-    for pref in prefixes:
-        summary_cols.extend([
-            f'{pref}_Total_Throughput',
-            f'{pref}_PRB_Usage (%)',
-            f'{pref}_Time_Taken',
-        ])
-    summary_cols = [c for c in summary_cols if c in results_df.columns]
+    rows = {}
+    for method in methods:
+        row = {}
+        for metric_name, col_template in metric_specs:
+            for slice_id, slice_label in slice_labels.items():
+                col = col_template.format(method=method, slice_id=slice_id)
+                if col in results_df.columns:
+                    values = pd.to_numeric(results_df[col], errors="coerce")
+                    row[(metric_name, slice_label)] = values.mean()
+                else:
+                    row[(metric_name, slice_label)] = np.nan
+        rows[method] = row
 
-    app_cols = []
-    for pref in prefixes:
-        app_cols.extend([c for c in results_df.columns if c.startswith(f"{pref}_App_")])
+    summary_df = pd.DataFrame.from_dict(rows, orient="index")
+    summary_df.index.name = "Method"
+    summary_df.columns = pd.MultiIndex.from_tuples(summary_df.columns)
+    summary_df = summary_df.reindex(columns=pd.MultiIndex.from_tuples([
+        ("Delay", "Critic"),
+        ("Delay", "Perf"),
+        ("Delay", "Business"),
+        ("Throughput", "Critic"),
+        ("Throughput", "Perf"),
+        ("Throughput", "Business"),
+    ]))
 
-    all_cols = summary_cols + app_cols
-    print("\n=== Final Results Overview ===")
-    print(results_df[all_cols].to_string(index=False))
+    print("\n=== ADSS Delay and Throughput Violation Rates (%) ===")
+    print(summary_df.round(2).to_string())
 
 def plot_compare_training(df_dqn, df_ppo):
     """
