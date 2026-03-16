@@ -2038,7 +2038,7 @@ def plot_all_results(results_df):
         for x in [1.5, 3.5]:
             ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
         _set_axis_fonts('Applications', 'Average Delay (ms)')
-        plt.title('Average Delay per App', fontsize=26)
+        plt.title('Average Delay per App', fontsize=24)
         handles, labels = ax.get_legend_handles_labels()
         numbered = [f"{idx_map[l]}. {l}" for l in labels]
         ax.legend(handles, numbered, fontsize=12)
@@ -2200,7 +2200,7 @@ def plot_compare_training(df_dqn, df_ppo):
         y='Episode_Reward',
         data=df_dqn,
         marker='o',
-        color='purple',
+        color='orangered',
         label='ADSS_DQN'
     )
     sns.lineplot(
@@ -2208,7 +2208,7 @@ def plot_compare_training(df_dqn, df_ppo):
         y='Episode_Reward',
         data=df_ppo,
         marker='s',
-        color='orangered',
+        color='black',
         label='ADSS_PPO'
     )
     plt.xlabel('Episode', fontsize=14)
