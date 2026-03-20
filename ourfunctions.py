@@ -1730,31 +1730,9 @@ def plot_all_results(results_df):
     plt.tight_layout()
     plt.show()
 
-    # --- 3-bis) Jain Fairness per Episode ----------------------
+    # --- 3-bis) Average user Jain fairness (bar) --------------
     jain_methods = [m for m in active_methods if f"{prefix_map[m]}_Jain_Fairness" in results_df.columns]
     if jain_methods:
-        plt.figure(figsize=(10, 6))
-        for m in jain_methods:
-            col = f"{prefix_map[m]}_Jain_Fairness"
-            plt.plot(
-                results_df['Simulation'],
-                results_df[col],
-                marker=marker_map[m],
-                label=m,
-                color=palette[m],
-                linestyle=linestyle_map[m],
-            )
-        _set_axis_fonts('Allocation Episodes', "Jain's Fairness Index")
-        plt.ylim(0, 1.05)
-        plt.title("Jain's Fairness", fontsize=26)
-        plt.yticks(fontsize=18)
-        handles, labels = plt.gca().get_legend_handles_labels()
-        numbered = [f"{idx_map[l]}. {l}" for l in labels]
-        plt.legend(handles, numbered, fontsize=12)
-        plt.tight_layout()
-        plt.show()
-
-        # --- 3-ter) Average Jain Fairness (bar) ----------------
         avg_jain_df = pd.DataFrame({
             'Method': jain_methods,
             'Average_Jain_Fairness': [
@@ -1787,11 +1765,60 @@ def plot_all_results(results_df):
             )
         if ax.get_legend() is not None:
             ax.get_legend().remove()
-        _set_axis_fonts('', "Average Jain's Fairness Index")
+        _set_axis_fonts('', "Average User Jain's Fairness Index")
         plt.ylim(0, 1.05)
         plt.xticks(fontsize=14)
         plt.yticks(fontsize=14)
-        plt.title("Jain's Fairness", fontsize=26)
+        plt.title("Average User Jain's Fairness", fontsize=26)
+        plt.tight_layout()
+        plt.show()
+
+    # --- 3-ter) Per-application fairness across users ---------
+    app_jain_methods = [
+        m for m in active_methods
+        if all(f"{prefix_map[m]}_App_{a}_Jain_Fairness" in results_df.columns for a in [1, 2, 3, 4, 5])
+    ]
+    if app_jain_methods:
+        app_fairness = {'Application': app_labels}
+        for m in app_jain_methods:
+            pref = prefix_map[m]
+            app_fairness[m] = [
+                results_df[f"{pref}_App_{a}_Jain_Fairness"].mean() for a in [1, 2, 3, 4, 5]
+            ]
+
+        app_jain_df = pd.DataFrame(app_fairness).melt(
+            id_vars=['Application'], var_name='Method', value_name='Jain_Fairness'
+        )
+        app_jain_df['Method'] = pd.Categorical(
+            app_jain_df['Method'], categories=app_jain_methods, ordered=True
+        )
+
+        plt.figure(figsize=(12, 6))
+        ax = _barplot_no_error(
+            data=app_jain_df,
+            x='Application',
+            y='Jain_Fairness',
+            hue='Method',
+            hue_order=app_jain_methods,
+            palette={m: palette[m] for m in app_jain_methods}
+        )
+        for x in [1.5, 3.5]:
+            ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
+        for container in ax.containers:
+            ax.bar_label(
+                container,
+                fmt='%.3f',
+                label_type='edge',
+                padding=3,
+                fontsize=12,
+                color='black'
+            )
+        plt.ylim(0, 1.05)
+        _set_axis_fonts('Applications', "Average App Jain's Fairness Index")
+        plt.title("Per-Application Jain's Fairness", fontsize=26)
+        handles, labels = ax.get_legend_handles_labels()
+        numbered = [f"{idx_map[l]}. {l}" for l in labels]
+        ax.legend(handles, numbered, fontsize=12)
         plt.tight_layout()
         plt.show()
     # --- helper maps -----------------------------------------
