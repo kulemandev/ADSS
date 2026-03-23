@@ -18,6 +18,7 @@ from torch.distributions import Categorical
 from torch.distributions import Dirichlet
 
 import os
+import re
 from functools import lru_cache
 from collections import defaultdict
 import importlib.util
@@ -2218,6 +2219,48 @@ def plot_all_results(results_df):
         plt.legend(loc='lower left', bbox_to_anchor=(0.02, 0.02), fontsize=14, frameon=True)
         plt.tight_layout()
         plt.show()
+
+def save_plot_all_results(results_df, output_dir="images", dpi=300, close_figures=True):
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    original_show = plt.show
+    saved_files = []
+    name_counts = {}
+
+    def _title_to_name(title, fallback_index):
+        cleaned = title.strip().lower()
+        cleaned = re.sub(r'[^a-z0-9]+', '_', cleaned).strip('_')
+        return cleaned or f"figure_{fallback_index}"
+
+    def _show_and_save(*args, **kwargs):
+        fig = plt.gcf()
+        axes = fig.get_axes()
+        title = ''
+        for ax in axes:
+            title = ax.get_title().strip()
+            if title:
+                break
+
+        base_name = _title_to_name(title, len(saved_files) + 1)
+        count = name_counts.get(base_name, 0) + 1
+        name_counts[base_name] = count
+        file_name = f"{base_name}.png" if count == 1 else f"{base_name}_{count}.png"
+        file_path = output_path / file_name
+
+        fig.savefig(file_path, dpi=dpi, bbox_inches='tight')
+        saved_files.append(str(file_path))
+        original_show(*args, **kwargs)
+        if close_figures:
+            plt.close(fig)
+
+    try:
+        plt.show = _show_and_save
+        plot_all_results(results_df)
+    finally:
+        plt.show = original_show
+
+    return saved_files
 
 # ------------------------------------------------------------------
 def print_final_results(results_df):
