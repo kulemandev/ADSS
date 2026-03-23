@@ -522,7 +522,7 @@ def run_bestcqi_allocation(gamma, return_decision_time=False):
                 # Allocate zero if SLA already met; otherwise cap by remaining
                 if remaining <= 0:
                     #delta = 0.0
-                    delta = best_thr * 0.5
+                    delta = best_thr * 0.4
                     prb_assignments.append((t, k_, i_sel, a_sel, s_sel, delta))
                     allocated_so_far[app_key] += delta
                 else:
@@ -631,7 +631,7 @@ def run_myheuristic_allocation(gamma, return_decision_time=False):
     """
     w_perf= 0.5
     w_busi= 0.5
-    drift = 1
+    drift = 0.9
     # Initialise slack bits for every app
     slack = {key: get_sla(key[1]) for key in APPKEY_LIST}
     prb_assignments = []
@@ -1111,7 +1111,7 @@ def run_kbl_allocation(
     gamma,
     accuracy_range=(0.99, 0.999),
     alfa=0.05,
-    drift_fallback=0.5,
+    drift_fallback=0.1,
     return_decision_time=False
 ):
     """
@@ -1358,7 +1358,7 @@ def _build_xslice_state(gamma, allocation_so_far, prev_prb_used):
     return np.array(state, dtype=np.float32)
 
 
-def _xslice_allocate_slot(gamma, slice_quota, slack, allocation_so_far, t, drift_fallback=0.5):
+def _xslice_allocate_slot(gamma, slice_quota, slack, allocation_so_far, t, drift_fallback=0.1):
     slice_appkeys = {s: [ak for ak in APPKEY_LIST if ak[2] == s] for s in [1, 2, 3]}
     allocation_records = []
     slice_thr_slot = {1: 0.0, 2: 0.0, 3: 0.0}
@@ -1422,7 +1422,7 @@ def run_xslice_allocation(
     lr=3e-4,
     gamma_rl=0.95,
     clip_eps=0.2,
-    drift_fallback=0.5,
+    drift_fallback=0.1,
     return_decision_time=False,
 ):
     obs_dim = 12
@@ -1730,7 +1730,53 @@ def plot_all_results(results_df):
     plt.tight_layout()
     plt.show()
 
-    # --- 3-bis) Average user Jain fairness (bar) --------------
+    # --- 3-bis) Average total spectral efficiency (horizontal bar) ---
+    if prb_methods:
+        avg_total_se = []
+        for m in prb_methods:
+            thr_col = f"{prefix_map[m]}_Total_Throughput"
+            usage_col = f"{prefix_map[m]}_PRB_Usage (%)"
+            used_prbs = (results_df[usage_col] / 100) * total_prbs
+            se = results_df[thr_col] / used_prbs.replace(0, np.nan)
+            avg_total_se.append({
+                'Method': m,
+                'Average_Total_SE': se.mean(skipna=True)
+            })
+
+        avg_total_se_df = pd.DataFrame(avg_total_se)
+        avg_total_se_df['Method'] = pd.Categorical(
+            avg_total_se_df['Method'], categories=prb_methods, ordered=True
+        )
+        avg_total_se_df = avg_total_se_df.sort_values('Method')
+
+        method_display_names = [
+            "Optimal" if m in ("Optimal ILP", "Optimal") else m
+            for m in avg_total_se_df['Method']
+        ]
+        se_values = avg_total_se_df['Average_Total_SE'].to_numpy(dtype=float)
+        colors = [palette[m] for m in avg_total_se_df['Method']]
+        x_max = np.nanmax(se_values) if np.size(se_values) else 1.0
+        text_offset = 0.01 * (x_max if x_max > 0 else 1.0)
+
+        plt.figure(figsize=(10, 6))
+        y_pos = np.arange(len(method_display_names))
+        bars = plt.barh(y_pos, se_values, color=colors)
+        for bar, val in zip(bars, se_values):
+            plt.text(
+                bar.get_width() + text_offset,
+                bar.get_y() + bar.get_height() / 2,
+                f'{val:.2f}',
+                va='center', ha='left', fontsize=13
+            )
+        plt.yticks(y_pos, method_display_names, fontsize=16)
+        plt.xlim(0, max(x_max * 1.20, 1.0))
+        plt.gca().invert_yaxis()
+        _set_axis_fonts('Average Spectral Efficiency (kbit per RB)', '')
+        plt.title('Average Spectral Efficiency', fontsize=26)
+        plt.tight_layout()
+        plt.show()
+
+    # --- 3-ter) Average user Jain fairness (bar) --------------
     jain_methods = [m for m in active_methods if f"{prefix_map[m]}_Jain_Fairness" in results_df.columns]
     if jain_methods:
         avg_jain_df = pd.DataFrame({
@@ -1765,11 +1811,11 @@ def plot_all_results(results_df):
             )
         if ax.get_legend() is not None:
             ax.get_legend().remove()
-        _set_axis_fonts('', "Average User Jain's Fairness Index")
+        _set_axis_fonts('', "Jain's Fairness Index")
         plt.ylim(0, 1.05)
         plt.xticks(fontsize=14)
         plt.yticks(fontsize=14)
-        plt.title("Average User Jain's Fairness", fontsize=26)
+        plt.title("Inter-train Jain's Fairness", fontsize=26)
         plt.tight_layout()
         plt.show()
 
@@ -1805,20 +1851,28 @@ def plot_all_results(results_df):
         for x in [1.5, 3.5]:
             ax.axvline(x=x, color='black', linestyle='--', linewidth=1)
         for container in ax.containers:
+            labels = []
+            for patch in container:
+                height = patch.get_height()
+                if np.isnan(height):
+                    labels.append('')
+                elif height < 1:
+                    labels.append(f"{height:.2f}".replace("0.", ""))
+                else:
+                    labels.append(f"{height:.2f}")
             ax.bar_label(
                 container,
-                fmt='%.3f',
+                labels=labels,
                 label_type='edge',
                 padding=3,
                 fontsize=12,
                 color='black'
             )
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
         plt.ylim(0, 1.05)
-        _set_axis_fonts('Applications', "Average App Jain's Fairness Index")
-        plt.title("Per-Application Jain's Fairness", fontsize=26)
-        handles, labels = ax.get_legend_handles_labels()
-        numbered = [f"{idx_map[l]}. {l}" for l in labels]
-        ax.legend(handles, numbered, fontsize=12)
+        _set_axis_fonts('Applications', "App Jain's Fairness")
+        plt.title("Applications inter-train  Jain's Fairness", fontsize=26)
         plt.tight_layout()
         plt.show()
     # --- helper maps -----------------------------------------
