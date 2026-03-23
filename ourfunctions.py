@@ -1727,7 +1727,7 @@ def plot_all_results(results_df):
     plt.title('Spectral Efficiency per Episode', fontsize=26)
     handles, labels = plt.gca().get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
-    plt.legend(handles, numbered, fontsize=12)
+    plt.legend(handles, numbered, fontsize=11)
     plt.tight_layout()
     plt.show()
 
@@ -2174,8 +2174,8 @@ def plot_all_results(results_df):
 
         plt.xticks(x, method_display_names)
         plt.ylabel('(Bit per RB)', fontsize=14)
-        plt.xlabel('', fontsize=15)
-        plt.xticks(fontsize=14)
+        plt.xlabel('', fontsize=14)
+        plt.xticks(fontsize=12)
         plt.yticks(fontsize=18)
         plt.title('Average Per-Slice Spectral Efficiency', fontsize=26)
         plt.legend(title='Slice', fontsize=12, title_fontsize=12)
