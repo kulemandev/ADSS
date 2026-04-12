@@ -1638,11 +1638,11 @@ def plot_all_results(results_df):
 
     def _set_axis_fonts(xlabel=None, ylabel=None):
         if xlabel is not None:
-            plt.xlabel(xlabel, fontsize=20)
+            plt.xlabel(xlabel, fontsize=24)
         if ylabel is not None:
-            plt.ylabel(ylabel, fontsize=20)
-        plt.xticks(fontsize=22)
-        plt.yticks(fontsize=18)
+            plt.ylabel(ylabel, fontsize=24)
+        plt.xticks(fontsize=24)
+        plt.yticks(fontsize=24)
 
     def _barplot_no_error(**kwargs):
         # seaborn>=0.12 uses errorbar=None; older versions use ci=None
@@ -1767,9 +1767,9 @@ def plot_all_results(results_df):
                 bar.get_width() + text_offset,
                 bar.get_y() + bar.get_height() / 2,
                 f'{val:.2f}',
-                va='center', ha='left', fontsize=13
+                va='center', ha='left', fontsize=18
             )
-        plt.yticks(y_pos, method_display_names, fontsize=16)
+        plt.yticks(y_pos, method_display_names, fontsize=20)
         plt.xlim(0, max(x_max * 1.20, 1.0))
         plt.gca().invert_yaxis()
         _set_axis_fonts('Average Spectral Efficiency (kbit per RB)', '')
@@ -1807,15 +1807,17 @@ def plot_all_results(results_df):
                 fmt='%.3f',
                 label_type='edge',
                 padding=3,
-                fontsize=12,
+                fontsize=20,
                 color='black'
             )
         if ax.get_legend() is not None:
             ax.get_legend().remove()
-        _set_axis_fonts('', "Jain's Fairness Index")
+        ax.set_xlabel('', fontsize=22)
+        ax.set_ylabel("Jain's Fairness Index", fontsize=26)
+        #_set_axis_fonts('', "Jain's Fairness Index",fontsize=22)
         plt.ylim(0, 1.05)
         plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
+        plt.yticks(fontsize=20)
         plt.title("Inter-train Jain's Fairness", fontsize=26)
         plt.tight_layout()
         plt.show()
@@ -1872,8 +1874,13 @@ def plot_all_results(results_df):
         if ax.get_legend() is not None:
             ax.get_legend().remove()
         plt.ylim(0, 1.05)
-        _set_axis_fonts('Applications', "App Jain's Fairness")
-        plt.title("Applications inter-train  Jain's Fairness", fontsize=26)
+
+        ax.set_xlabel('', fontsize=24)
+        ax.set_ylabel("App Jain's Fairness", fontsize=26)
+        ax.set_title("Applications inter-train Jain's Fairness", fontsize=26)
+
+        ax.tick_params(axis='x', labelsize=24)   # category names under bars
+        ax.tick_params(axis='y', labelsize=24)
         plt.tight_layout()
         plt.show()
     # --- helper maps -----------------------------------------
@@ -2076,10 +2083,19 @@ def plot_all_results(results_df):
         x_start = app_positions[i] - (1.5 * bar_width)
         x_end = app_positions[i] + (1.5 * bar_width)
         plt.plot([x_start, x_end], [sla, sla], color='red', linestyle='--', linewidth=2)
-        plt.text(i, sla + y_max * 0.01, f"SLA: {sla}", color='red', ha='right', fontsize=11)
+        plt.text(i, sla + y_max * 0.01, f"SLA: {sla}", color='red', ha='right', fontsize=14)
 
-    _set_axis_fonts('Applications', 'Average throughput (Bits/frame)')
-    plt.title('Per-Application Average Throughput', fontsize=26)
+
+    #plt.ylim(0, 1.05)
+
+    ax.set_xlabel('', fontsize=24)
+    ax.set_ylabel("Avg. throughput (Bits/frame)", fontsize=26)
+
+    ax.tick_params(axis='x', labelsize=22)   # category names under bars
+    ax.tick_params(axis='y', labelsize=20)
+
+    
+    #plt.title('Per-Application Average Throughput', fontsize=26)
     handles, labels = ax.get_legend_handles_labels()
     numbered = [f"{idx_map[l]}. {l}" for l in labels]
     ax.legend(handles, numbered, fontsize=12)
@@ -2168,55 +2184,17 @@ def plot_all_results(results_df):
                     plt.text(
                         x[j], bottom[j] + v / 2,
                         f'{v:.2f}',
-                        ha='center', va='center', fontsize=10
+                        ha='center', va='center', fontsize=14
                     )
             bottom += vals
 
         plt.xticks(x, method_display_names)
-        plt.ylabel('(Bit per RB)', fontsize=14)
+        plt.ylabel('(Bit per RB)', fontsize=24)
         plt.xlabel('', fontsize=14)
-        plt.xticks(fontsize=12)
-        plt.yticks(fontsize=18)
-        plt.title('Average Per-Slice Spectral Efficiency', fontsize=26)
-        plt.legend(title='Slice', fontsize=12, title_fontsize=12)
-        plt.tight_layout()
-        plt.show()
-
-        ##### 2) Horizontal grouped bar by method #####
-        n_methods, n_slices = data.shape
-        y = np.arange(n_methods)
-        bar_h = 0.8 / n_slices
-
-        ##### 3) Horizontal grouped bar by slice #####
-        data_t = data.T  # slices x methods
-        ys = np.arange(len(slice_labels))
-        bar_h2 = 0.8 / n_methods
-        x_max = np.nanmax(data_t) if np.size(data_t) else 1.0
-        text_offset = 0.01 * (x_max if x_max > 0 else 1.0)
-
-        plt.figure(figsize=(10, 6))
-        for j, m in enumerate(method_names):
-            vals = data_t[:, j]
-            display_label = "Optimal" if m in ("Optimal ILP", "Optimal") else m
-            legend_label = f"{idx_map[m]}. {display_label}"
-            bars = plt.barh(
-                ys + (j - (n_methods - 1) / 2) * bar_h2,
-                vals,
-                height=bar_h2,
-                label=legend_label,
-                color=method_colors[m]
-            )
-            for bar in bars:
-                w = bar.get_width()
-                yc = bar.get_y() + bar.get_height() / 2
-                plt.text(w + text_offset, yc, f'{w:.2f}',
-                         va='center', ha='left', fontsize=13)
-
-        plt.yticks(ys, slice_labels, fontsize=16)
         plt.xticks(fontsize=14)
-        plt.xlabel('Avg Spectral Efficiency (Bit per RB)', fontsize=16)
-        plt.xlim(0, max(x_max * 1.20, 1.0))
-        plt.legend(loc='lower left', bbox_to_anchor=(0.02, 0.02), fontsize=14, frameon=True)
+        plt.yticks(fontsize=16)
+        plt.title('Average Per-Slice Spectral Efficiency', fontsize=26)
+        plt.legend(title='Slice', fontsize=12, title_fontsize=13)
         plt.tight_layout()
         plt.show()
 
